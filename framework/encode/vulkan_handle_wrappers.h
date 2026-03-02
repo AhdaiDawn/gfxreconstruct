@@ -286,6 +286,16 @@ struct DeviceMemoryWrapper : public HandleWrapper<VkDeviceMemory>
     VkMemoryMapFlags mapped_flags{ 0 };
     void*            external_allocation{ nullptr };
     uintptr_t        shadow_allocation{ util::PageGuardManager::kNullShadowHandle };
+
+    // Shadow buffer for unassisted tracking mode with hash-based dirty detection.
+    // When active, the application writes to shadow_buffer (fast cached CPU memory),
+    // and only dirty 4KB pages are synced to real_mapped_ptr (WC/uncached GPU memory).
+    void*                 real_mapped_ptr{ nullptr };  // Original driver-returned mapped pointer
+    void*                 shadow_buffer{ nullptr };    // malloc'd shadow buffer returned to app
+    std::vector<uint64_t> page_hashes;                 // Per-4KB-page hash values for dirty detection
+    VkDeviceSize          shadow_size{ 0 };            // Size of the shadow buffer in bytes
+    bool                  shadow_first_submit{ true }; // Must do full dump on first QueueSubmit after map
+
     AHardwareBuffer* hardware_buffer{ nullptr };
     format::HandleId hardware_buffer_memory_id{ format::kNullHandleId };
     int              imported_fd{ -1 };

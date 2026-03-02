@@ -43,6 +43,8 @@
 #include "graphics/vulkan_util.h"
 #include "graphics/vulkan_feature_util.h"
 #include "util/compressor.h"
+#include "util/date_time.h"
+#include "util/hash.h"
 #include "util/logging.h"
 #include "util/page_guard_manager.h"
 #include "util/platform.h"
@@ -2812,6 +2814,97 @@ void VulkanCaptureManager::PostProcess_vkMapMemory(VkResult         result,
             }
             else if (GetMemoryTrackingMode() == CaptureSettings::MemoryTrackingMode::kUnassisted)
             {
+                // Shadow buffer + hash-based dirty detection for unassisted mode.
+                // Allocate a shadow buffer in fast cached CPU memory. The application will write to this
+                // shadow buffer instead of the real WC/uncached GPU-mapped pointer, eliminating slow
+                // uncached reads during dirty detection.
+                VkDeviceSize effective_size = size;
+                if (effective_size == VK_WHOLE_SIZE)
+                {
+                    assert(offset <= wrapper->allocation_size);
+                    effective_size = wrapper->allocation_size - offset;
+                }
+
+                if (effective_size > 0)
+                {
+                    int64_t map_t0 = util::datetime::GetTimestamp();
+
+                    wrapper->real_mapped_ptr     = (*ppData);
+                    wrapper->shadow_size         = effective_size;
+                    wrapper->shadow_first_submit = true;
+                    wrapper->shadow_buffer       = malloc(static_cast<size_t>(effective_size));
+
+                    int64_t malloc_t1 = util::datetime::GetTimestamp();
+
+                    if (wrapper->shadow_buffer != nullptr)
+                    {
+                        // Initialize shadow buffer from the real mapped memory so that any pre-existing
+                        // content is visible to the application. This is a one-time read from WC memory.
+                        memcpy(wrapper->shadow_buffer, (*ppData), static_cast<size_t>(effective_size));
+
+                        int64_t memcpy_t1 = util::datetime::GetTimestamp();
+
+                        // Initialize page hashes: compute hash for each 4KB page of the initial content.
+                        static constexpr size_t kPageSize = 4096;
+                        size_t num_pages = (static_cast<size_t>(effective_size) + kPageSize - 1) / kPageSize;
+                        wrapper->page_hashes.resize(num_pages, 0);
+
+                        const uint8_t* shadow_bytes = static_cast<const uint8_t*>(wrapper->shadow_buffer);
+                        for (size_t i = 0; i < num_pages; ++i)
+                        {
+                            size_t page_offset = i * kPageSize;
+                            size_t page_len    = kPageSize;
+                            if (page_offset + page_len > static_cast<size_t>(effective_size))
+                            {
+                                page_len = static_cast<size_t>(effective_size) - page_offset;
+                            }
+                            wrapper->page_hashes[i] = util::hash::FastBlockHash64(shadow_bytes + page_offset, page_len);
+                        }
+
+                        int64_t hash_t1 = util::datetime::GetTimestamp();
+
+                        double malloc_ms = util::datetime::ConvertTimestampToMilliseconds(malloc_t1 - map_t0);
+                        double memcpy_ms = util::datetime::ConvertTimestampToMilliseconds(memcpy_t1 - malloc_t1);
+                        double hash_ms   = util::datetime::ConvertTimestampToMilliseconds(hash_t1 - memcpy_t1);
+                        double total_ms  = util::datetime::ConvertTimestampToMilliseconds(hash_t1 - map_t0);
+
+                        GFXRECON_LOG_INFO("[Shadow] MapMemory: id=%" PRIu64 ", size=%" PRIu64 " KB (%zu pages), "
+                                          "init=%.2f ms (malloc=%.2f, memcpy_from_WC=%.2f, hash_init=%.2f)",
+                                          wrapper->handle_id,
+                                          effective_size / 1024,
+                                          num_pages,
+                                          total_ms,
+                                          malloc_ms,
+                                          memcpy_ms,
+                                          hash_ms);
+
+                        // Return shadow buffer to the application instead of the real mapped pointer.
+                        (*ppData) = wrapper->shadow_buffer;
+
+                        // Update mapped_data to point to shadow so that WriteFillMemoryCmd reads from
+                        // cached shadow memory instead of slow WC/uncached real mapped memory.
+                        // This works for both track and non-track capture modes since TrackMappedMemory
+                        // and the direct assignment both set wrapper->mapped_data before we get here.
+                        wrapper->mapped_data = wrapper->shadow_buffer;
+
+                        if (IsCaptureModeTrack())
+                        {
+                            // Re-track with shadow pointer so state tracker also sees the shadow.
+                            state_tracker_->TrackMappedMemory(
+                                device, memory, wrapper->shadow_buffer, offset, size, flags);
+                        }
+                    }
+                    else
+                    {
+                        // malloc failed: fall back to using the real pointer (no shadow).
+                        GFXRECON_LOG_ERROR("Failed to allocate shadow buffer of %" PRIu64
+                                           " bytes for unassisted tracking, falling back to direct mapping",
+                                           effective_size);
+                        wrapper->real_mapped_ptr = nullptr;
+                        wrapper->shadow_size     = 0;
+                    }
+                }
+
                 // Need to keep track of mapped memory objects so memory content can be written at queue submit.
                 std::lock_guard<std::mutex> lock(GetMappedMemoryLock());
                 mapped_memory_.insert(wrapper);
@@ -2838,6 +2931,14 @@ void VulkanCaptureManager::PostProcess_vkMapMemory(VkResult         result,
                 {
                     GFXRECON_LOG_ERROR("Modifications to the VkDeviceMemory object that has been mapped more than once "
                                        "are not being track by PageGuardManager");
+                }
+            }
+            else if (GetMemoryTrackingMode() == CaptureSettings::MemoryTrackingMode::kUnassisted)
+            {
+                // Return the existing shadow buffer for the previous map operation.
+                if (wrapper->shadow_buffer != nullptr)
+                {
+                    (*ppData) = wrapper->shadow_buffer;
                 }
             }
         }
@@ -2931,6 +3032,47 @@ void VulkanCaptureManager::PreProcess_vkFlushMappedMemoryRanges(VkDevice        
                 }
             }
         }
+        else if (GetMemoryTrackingMode() == CaptureSettings::MemoryTrackingMode::kUnassisted)
+        {
+            // For unassisted mode with shadow buffers, process dirty pages for each flushed memory.
+            // Deduplicate: if the same memory appears multiple times, only process once.
+            const vulkan_wrappers::DeviceMemoryWrapper* current_memory_wrapper = nullptr;
+
+            for (uint32_t i = 0; i < memoryRangeCount; ++i)
+            {
+                auto next_memory_wrapper =
+                    vulkan_wrappers::GetWrapper<vulkan_wrappers::DeviceMemoryWrapper>(pMemoryRanges[i].memory);
+
+                if (next_memory_wrapper != current_memory_wrapper)
+                {
+                    current_memory_wrapper = next_memory_wrapper;
+
+                    if ((current_memory_wrapper != nullptr) && (current_memory_wrapper->mapped_data != nullptr))
+                    {
+                        if (current_memory_wrapper->shadow_buffer != nullptr)
+                        {
+                            // const_cast is safe: ProcessShadowMemoryDirtyPages only modifies mutable
+                            // tracking state (page_hashes) and syncs shadow -> real.
+                            ProcessShadowMemoryDirtyPages(
+                                const_cast<vulkan_wrappers::DeviceMemoryWrapper*>(current_memory_wrapper));
+                        }
+                        else
+                        {
+                            // No shadow buffer (fallback): write entire mapped region.
+                            VkDeviceSize size = current_memory_wrapper->mapped_size;
+                            if (size == VK_WHOLE_SIZE)
+                            {
+                                assert(current_memory_wrapper->mapped_offset <=
+                                       current_memory_wrapper->allocation_size);
+                                size = current_memory_wrapper->allocation_size - current_memory_wrapper->mapped_offset;
+                            }
+                            WriteFillMemoryCmd(
+                                current_memory_wrapper->handle_id, 0, size, current_memory_wrapper->mapped_data);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2964,16 +3106,58 @@ void VulkanCaptureManager::PreProcess_vkUnmapMemory(VkDevice device, VkDeviceMem
         }
         else if (GetMemoryTrackingMode() == CaptureSettings::MemoryTrackingMode::kUnassisted)
         {
-            VkDeviceSize size = wrapper->mapped_size;
-            if (size == VK_WHOLE_SIZE)
+            if (wrapper->shadow_buffer != nullptr)
             {
-                assert(wrapper->mapped_offset <= wrapper->allocation_size);
-                size = wrapper->allocation_size - wrapper->mapped_offset;
-            }
+                int64_t          unmap_t0 = util::datetime::GetTimestamp();
+                ShadowDirtyStats stats{};
 
-            // Write the entire mapped region.
-            // We set offset to 0, because the pointer returned by vkMapMemory already includes the offset.
-            WriteFillMemoryCmd(wrapper->handle_id, 0, size, wrapper->mapped_data);
+                // Final dirty page detection and sync before unmapping.
+                ProcessShadowMemoryDirtyPages(wrapper, &stats);
+
+                int64_t unmap_t1 = util::datetime::GetTimestamp();
+
+                // Free shadow buffer and reset tracking state.
+                free(wrapper->shadow_buffer);
+                wrapper->shadow_buffer   = nullptr;
+                wrapper->real_mapped_ptr = nullptr;
+                wrapper->shadow_size     = 0;
+                wrapper->page_hashes.clear();
+                wrapper->page_hashes.shrink_to_fit();
+
+                int64_t unmap_t2 = util::datetime::GetTimestamp();
+
+                GFXRECON_LOG_INFO("[Shadow] UnmapMemory: id=%" PRIu64 ", sync=%.2f ms "
+                                  "(hash=%.2f, sync=%.2f, write=%.2f), "
+                                  "free=%.2f ms | %zu/%zu dirty pages, %zu KB dirty",
+                                  wrapper->handle_id,
+                                  util::datetime::ConvertTimestampToMilliseconds(unmap_t1 - unmap_t0),
+                                  util::datetime::ConvertTimestampToMilliseconds(stats.hash_ns),
+                                  util::datetime::ConvertTimestampToMilliseconds(stats.sync_ns),
+                                  util::datetime::ConvertTimestampToMilliseconds(stats.write_cmd_ns),
+                                  util::datetime::ConvertTimestampToMilliseconds(unmap_t2 - unmap_t1),
+                                  stats.dirty_pages,
+                                  stats.total_pages,
+                                  stats.dirty_bytes / 1024);
+            }
+            else
+            {
+                // Fallback: no shadow buffer, write entire mapped region.
+                VkDeviceSize size = wrapper->mapped_size;
+                if (size == VK_WHOLE_SIZE)
+                {
+                    assert(wrapper->mapped_offset <= wrapper->allocation_size);
+                    size = wrapper->allocation_size - wrapper->mapped_offset;
+                }
+
+                int64_t fb_t0 = util::datetime::GetTimestamp();
+                WriteFillMemoryCmd(wrapper->handle_id, 0, size, wrapper->mapped_data);
+                int64_t fb_t1 = util::datetime::GetTimestamp();
+
+                GFXRECON_LOG_INFO("[Shadow] UnmapMemory FALLBACK: id=%" PRIu64 ", full write=%.2f ms, %zu KB",
+                                  wrapper->handle_id,
+                                  util::datetime::ConvertTimestampToMilliseconds(fb_t1 - fb_t0),
+                                  static_cast<size_t>(size) / 1024);
+            }
 
             {
                 std::lock_guard<std::mutex> lock(GetMappedMemoryLock());
@@ -3035,6 +3219,17 @@ void VulkanCaptureManager::PreProcess_vkFreeMemory(VkDevice                     
             }
             else if (GetMemoryTrackingMode() == CaptureSettings::MemoryTrackingMode::kUnassisted)
             {
+                // Free shadow buffer if it was allocated.
+                if (wrapper->shadow_buffer != nullptr)
+                {
+                    free(wrapper->shadow_buffer);
+                    wrapper->shadow_buffer   = nullptr;
+                    wrapper->real_mapped_ptr = nullptr;
+                    wrapper->shadow_size     = 0;
+                    wrapper->page_hashes.clear();
+                    wrapper->page_hashes.shrink_to_fit();
+                }
+
                 std::lock_guard<std::mutex> lock(GetMappedMemoryLock());
                 mapped_memory_.erase(wrapper);
             }
@@ -3178,6 +3373,8 @@ void VulkanCaptureManager::PreProcess_vkQueueSubmit(std::shared_lock<CommonCaptu
     GFXRECON_UNREFERENCED_PARAMETER(pSubmits);
     GFXRECON_UNREFERENCED_PARAMETER(fence);
 
+    int64_t preprocess_t0 = util::datetime::GetTimestamp();
+
     // This must be done before QueueSubmitWriteFillMemoryCmd is called
     // and tracked mapped memory regions are resetted
     if (IsCaptureModeTrack() && GetUseAssetFile())
@@ -3185,7 +3382,9 @@ void VulkanCaptureManager::PreProcess_vkQueueSubmit(std::shared_lock<CommonCaptu
         state_tracker_->TrackAssetsInSubmission(submitCount, pSubmits);
     }
 
+    int64_t fill_t0 = util::datetime::GetTimestamp();
     QueueSubmitWriteFillMemoryCmd();
+    int64_t fill_t1 = util::datetime::GetTimestamp();
 
     PreQueueSubmit(current_lock);
 
@@ -3206,6 +3405,14 @@ void VulkanCaptureManager::PreProcess_vkQueueSubmit(std::shared_lock<CommonCaptu
             }
         }
     }
+
+    int64_t preprocess_t1 = util::datetime::GetTimestamp();
+
+    GFXRECON_LOG_DEBUG(
+        "[Shadow] PreProcess_vkQueueSubmit: total=%.2f ms, FillMemoryCmd=%.2f ms, other=%.2f ms",
+        util::datetime::ConvertTimestampToMilliseconds(preprocess_t1 - preprocess_t0),
+        util::datetime::ConvertTimestampToMilliseconds(fill_t1 - fill_t0),
+        util::datetime::ConvertTimestampToMilliseconds((preprocess_t1 - preprocess_t0) - (fill_t1 - fill_t0)));
 }
 
 void VulkanCaptureManager::PreProcess_vkQueueSubmit2(
@@ -3272,21 +3479,318 @@ void VulkanCaptureManager::QueueSubmitWriteFillMemoryCmd()
     }
     else if (GetMemoryTrackingMode() == CaptureSettings::MemoryTrackingMode::kUnassisted)
     {
-        std::lock_guard<std::mutex> lock(GetMappedMemoryLock());
+        int64_t submit_t0 = util::datetime::GetTimestamp();
 
-        for (auto wrapper : mapped_memory_)
+        // Aggregated stats for this QueueSubmit across all mapped memories.
+        size_t  agg_total_pages    = 0;
+        size_t  agg_dirty_pages    = 0;
+        size_t  agg_dirty_bytes    = 0;
+        size_t  agg_total_bytes    = 0;
+        int64_t agg_hash_ns        = 0;
+        int64_t agg_sync_ns        = 0;
+        int64_t agg_write_ns       = 0;
+        size_t  agg_memory_count   = 0;
+        size_t  agg_fallback_count = 0;
+        int64_t agg_fallback_ns    = 0;
+
         {
-            VkDeviceSize size = wrapper->mapped_size;
-            if (size == VK_WHOLE_SIZE)
-            {
-                assert(wrapper->mapped_offset <= wrapper->allocation_size);
-                size = wrapper->allocation_size - wrapper->mapped_offset;
-            }
+            std::lock_guard<std::mutex> lock(GetMappedMemoryLock());
 
-            // If the memory is mapped, write the entire mapped region.
-            // We set offset to 0, because the pointer returned by vkMapMemory already includes the offset.
-            WriteFillMemoryCmd(wrapper->handle_id, 0, size, wrapper->mapped_data);
+            for (auto wrapper : mapped_memory_)
+            {
+                if (wrapper->shadow_buffer != nullptr)
+                {
+                    ShadowDirtyStats stats{};
+                    ProcessShadowMemoryDirtyPages(wrapper, &stats);
+
+                    agg_total_pages += stats.total_pages;
+                    agg_dirty_pages += stats.dirty_pages;
+                    agg_dirty_bytes += stats.dirty_bytes;
+                    agg_total_bytes += stats.total_bytes;
+                    agg_hash_ns += stats.hash_ns;
+                    agg_sync_ns += stats.sync_ns;
+                    agg_write_ns += stats.write_cmd_ns;
+                    agg_memory_count++;
+                }
+                else
+                {
+                    // Fallback: no shadow buffer (malloc failed), write entire mapped region.
+                    VkDeviceSize size = wrapper->mapped_size;
+                    if (size == VK_WHOLE_SIZE)
+                    {
+                        assert(wrapper->mapped_offset <= wrapper->allocation_size);
+                        size = wrapper->allocation_size - wrapper->mapped_offset;
+                    }
+
+                    int64_t fb_t0 = util::datetime::GetTimestamp();
+                    WriteFillMemoryCmd(wrapper->handle_id, 0, size, wrapper->mapped_data);
+                    int64_t fb_t1 = util::datetime::GetTimestamp();
+
+                    agg_fallback_count++;
+                    agg_fallback_ns += (fb_t1 - fb_t0);
+                    agg_total_bytes += static_cast<size_t>(size);
+                }
+            }
         }
+
+        int64_t submit_t1       = util::datetime::GetTimestamp();
+        int64_t submit_total_ns = submit_t1 - submit_t0;
+
+        // Update cumulative counters.
+        shadow_perf_submit_count_++;
+        shadow_perf_total_hash_ns_ += static_cast<uint64_t>(agg_hash_ns);
+        shadow_perf_total_sync_ns_ += static_cast<uint64_t>(agg_sync_ns);
+        shadow_perf_total_write_ns_ += static_cast<uint64_t>(agg_write_ns);
+        shadow_perf_total_dirty_bytes_ += agg_dirty_bytes;
+        shadow_perf_total_scanned_bytes_ += agg_total_bytes;
+        shadow_perf_total_dirty_pages_ += agg_dirty_pages;
+        shadow_perf_total_scanned_pages_ += agg_total_pages;
+
+        // Per-submit log (every submit -- use LOG_DEBUG so it can be filtered).
+        double total_ms = util::datetime::ConvertTimestampToMilliseconds(submit_total_ns);
+        double hash_ms  = util::datetime::ConvertTimestampToMilliseconds(agg_hash_ns);
+        double sync_ms  = util::datetime::ConvertTimestampToMilliseconds(agg_sync_ns);
+        double write_ms = util::datetime::ConvertTimestampToMilliseconds(agg_write_ns);
+        double dirty_pct =
+            (agg_total_pages > 0) ? (100.0 * static_cast<double>(agg_dirty_pages) / agg_total_pages) : 0.0;
+
+        GFXRECON_LOG_DEBUG("[Shadow] Submit #%" PRIu64 ": %.2f ms total | hash=%.2f ms, sync=%.2f ms, "
+                           "write=%.2f ms | %zu/%zu pages dirty (%.1f%%) | %zu/%zu KB dirty | "
+                           "%zu memories, %zu fallback",
+                           shadow_perf_submit_count_,
+                           total_ms,
+                           hash_ms,
+                           sync_ms,
+                           write_ms,
+                           agg_dirty_pages,
+                           agg_total_pages,
+                           dirty_pct,
+                           agg_dirty_bytes / 1024,
+                           agg_total_bytes / 1024,
+                           agg_memory_count,
+                           agg_fallback_count);
+
+        // Periodic cumulative summary every 100 submits.
+        if ((shadow_perf_submit_count_ % 100) == 0)
+        {
+            double cum_hash_ms =
+                util::datetime::ConvertTimestampToMilliseconds(static_cast<int64_t>(shadow_perf_total_hash_ns_));
+            double cum_sync_ms =
+                util::datetime::ConvertTimestampToMilliseconds(static_cast<int64_t>(shadow_perf_total_sync_ns_));
+            double cum_write_ms =
+                util::datetime::ConvertTimestampToMilliseconds(static_cast<int64_t>(shadow_perf_total_write_ns_));
+            double cum_dirty_pct =
+                (shadow_perf_total_scanned_pages_ > 0)
+                    ? (100.0 * static_cast<double>(shadow_perf_total_dirty_pages_) / shadow_perf_total_scanned_pages_)
+                    : 0.0;
+
+            GFXRECON_LOG_INFO("[Shadow] === Cumulative after %" PRIu64 " submits ===", shadow_perf_submit_count_);
+            GFXRECON_LOG_INFO("[Shadow]   Hash total:  %.1f ms (avg %.3f ms/submit)",
+                              cum_hash_ms,
+                              cum_hash_ms / shadow_perf_submit_count_);
+            GFXRECON_LOG_INFO("[Shadow]   Sync total:  %.1f ms (avg %.3f ms/submit)",
+                              cum_sync_ms,
+                              cum_sync_ms / shadow_perf_submit_count_);
+            GFXRECON_LOG_INFO("[Shadow]   Write total: %.1f ms (avg %.3f ms/submit)",
+                              cum_write_ms,
+                              cum_write_ms / shadow_perf_submit_count_);
+            GFXRECON_LOG_INFO("[Shadow]   Dirty ratio: %.1f%% (%" PRIu64 "/%" PRIu64 " pages), %" PRIu64
+                              " KB / %" PRIu64 " KB scanned",
+                              cum_dirty_pct,
+                              shadow_perf_total_dirty_pages_,
+                              shadow_perf_total_scanned_pages_,
+                              shadow_perf_total_dirty_bytes_ / 1024,
+                              shadow_perf_total_scanned_bytes_ / 1024);
+        }
+    }
+}
+
+void VulkanCaptureManager::ProcessShadowMemoryDirtyPages(vulkan_wrappers::DeviceMemoryWrapper* wrapper,
+                                                         ShadowDirtyStats*                     out_stats)
+{
+    static constexpr size_t kPageSize = 4096;
+
+    GFXRECON_ASSERT(wrapper != nullptr);
+    GFXRECON_ASSERT(wrapper->shadow_buffer != nullptr);
+    GFXRECON_ASSERT(wrapper->real_mapped_ptr != nullptr);
+
+    const size_t total_size   = static_cast<size_t>(wrapper->shadow_size);
+    const size_t num_pages    = wrapper->page_hashes.size();
+    uint8_t*     shadow_bytes = static_cast<uint8_t*>(wrapper->shadow_buffer);
+    uint8_t*     real_bytes   = static_cast<uint8_t*>(wrapper->real_mapped_ptr);
+
+    // First QueueSubmit after MapMemory: must dump the ENTIRE shadow content to the capture file.
+    // This is necessary because the replay side has no prior knowledge of the memory's content —
+    // it could contain data from GPU copies, prior usage, etc. that was present at map time.
+    // After this initial dump, subsequent submits only need to record changed pages.
+    if (wrapper->shadow_first_submit)
+    {
+        wrapper->shadow_first_submit = false;
+
+        int64_t full_t0 = util::datetime::GetTimestamp();
+
+        // Sync entire shadow → real GPU memory so the GPU sees everything the app wrote.
+        memcpy(real_bytes, shadow_bytes, total_size);
+
+        // Write entire content to capture file.
+        WriteFillMemoryCmd(wrapper->handle_id, 0, total_size, wrapper->shadow_buffer);
+
+        // Recompute all page hashes to establish correct baseline for future dirty detection.
+        for (size_t i = 0; i < num_pages; ++i)
+        {
+            size_t page_offset = i * kPageSize;
+            size_t page_len    = kPageSize;
+            if (page_offset + page_len > total_size)
+            {
+                page_len = total_size - page_offset;
+            }
+            wrapper->page_hashes[i] = util::hash::FastBlockHash64(shadow_bytes + page_offset, page_len);
+        }
+
+        int64_t full_t1 = util::datetime::GetTimestamp();
+
+        GFXRECON_LOG_DEBUG("[Shadow] First submit full dump: id=%" PRIu64 ", %zu KB in %.2f ms",
+                           wrapper->handle_id,
+                           total_size / 1024,
+                           util::datetime::ConvertTimestampToMilliseconds(full_t1 - full_t0));
+
+        if (out_stats != nullptr)
+        {
+            out_stats->total_pages  = num_pages;
+            out_stats->dirty_pages  = num_pages;
+            out_stats->dirty_bytes  = total_size;
+            out_stats->total_bytes  = total_size;
+            out_stats->hash_ns      = full_t1 - full_t0; // Approximate: includes sync+write+hash
+            out_stats->sync_ns      = 0;
+            out_stats->write_cmd_ns = 0;
+        }
+        return;
+    }
+
+    // ========== Pass 1: Hash shadow pages to detect app CPU writes ==========
+    // Also check real (GPU-mapped) memory for pages the GPU may have written to.
+    // This two-source detection ensures both CPU writes (to shadow) and GPU writes (to real)
+    // are captured correctly.
+    std::vector<size_t> dirty_indices;
+    dirty_indices.reserve(num_pages < 256 ? num_pages : 256);
+
+    int64_t hash_t0 = util::datetime::GetTimestamp();
+
+    for (size_t i = 0; i < num_pages; ++i)
+    {
+        size_t page_offset = i * kPageSize;
+        size_t page_len    = kPageSize;
+        if (page_offset + page_len > total_size)
+        {
+            page_len = total_size - page_offset;
+        }
+
+        uint64_t shadow_hash = util::hash::FastBlockHash64(shadow_bytes + page_offset, page_len);
+
+        if (shadow_hash != wrapper->page_hashes[i])
+        {
+            // App modified this page in the shadow buffer.
+            wrapper->page_hashes[i] = shadow_hash;
+            dirty_indices.push_back(i);
+        }
+        else
+        {
+            // Shadow page unchanged. Check if GPU wrote to the real mapped memory.
+            // For HOST_COHERENT memory, GPU DMA writes go directly to real_mapped_ptr
+            // and are invisible to the shadow buffer. We detect this by comparing
+            // the real page content against the shadow page.
+            // memcmp returns 0 if equal; for pages that are truly unchanged (the common case),
+            // memcmp will scan the full page. But this is necessary for correctness.
+            if (memcmp(real_bytes + page_offset, shadow_bytes + page_offset, page_len) != 0)
+            {
+                // GPU modified this page. Sync real -> shadow so the app sees it too,
+                // and mark as dirty for capture.
+                memcpy(shadow_bytes + page_offset, real_bytes + page_offset, page_len);
+                wrapper->page_hashes[i] = util::hash::FastBlockHash64(shadow_bytes + page_offset, page_len);
+                dirty_indices.push_back(i);
+            }
+        }
+    }
+
+    int64_t hash_t1 = util::datetime::GetTimestamp();
+
+    // ========== Pass 2: Sync dirty pages shadow -> real GPU memory ==========
+    // Only needed for app-modified pages (shadow -> real).
+    // GPU-modified pages were already synced real -> shadow above, no need to write back.
+    size_t  dirty_byte_count = 0;
+    int64_t sync_t0          = util::datetime::GetTimestamp();
+
+    for (size_t idx : dirty_indices)
+    {
+        size_t page_offset = idx * kPageSize;
+        size_t page_len    = kPageSize;
+        if (page_offset + page_len > total_size)
+        {
+            page_len = total_size - page_offset;
+        }
+        // Always sync shadow -> real to ensure GPU sees the latest data.
+        // For GPU-modified pages this is a no-op (shadow was just updated from real).
+        memcpy(real_bytes + page_offset, shadow_bytes + page_offset, page_len);
+        dirty_byte_count += page_len;
+    }
+
+    int64_t sync_t1 = util::datetime::GetTimestamp();
+
+    // ========== Pass 3: Write coalesced dirty runs to capture file ==========
+    int64_t write_t0 = util::datetime::GetTimestamp();
+
+    if (!dirty_indices.empty())
+    {
+        // Coalesce contiguous dirty page indices into runs.
+        size_t run_start_idx = dirty_indices[0];
+        size_t run_end_idx   = dirty_indices[0]; // inclusive
+
+        for (size_t d = 1; d < dirty_indices.size(); ++d)
+        {
+            if (dirty_indices[d] == run_end_idx + 1)
+            {
+                // Contiguous -- extend the run.
+                run_end_idx = dirty_indices[d];
+            }
+            else
+            {
+                // Gap found -- flush the current run.
+                size_t run_offset = run_start_idx * kPageSize;
+                size_t run_end    = (run_end_idx + 1) * kPageSize;
+                if (run_end > total_size)
+                {
+                    run_end = total_size;
+                }
+                WriteFillMemoryCmd(wrapper->handle_id, run_offset, run_end - run_offset, wrapper->shadow_buffer);
+
+                // Start new run.
+                run_start_idx = dirty_indices[d];
+                run_end_idx   = dirty_indices[d];
+            }
+        }
+
+        // Flush the last run.
+        size_t run_offset = run_start_idx * kPageSize;
+        size_t run_end    = (run_end_idx + 1) * kPageSize;
+        if (run_end > total_size)
+        {
+            run_end = total_size;
+        }
+        WriteFillMemoryCmd(wrapper->handle_id, run_offset, run_end - run_offset, wrapper->shadow_buffer);
+    }
+
+    int64_t write_t1 = util::datetime::GetTimestamp();
+
+    // Fill out stats if requested.
+    if (out_stats != nullptr)
+    {
+        out_stats->total_pages  = num_pages;
+        out_stats->dirty_pages  = dirty_indices.size();
+        out_stats->dirty_bytes  = dirty_byte_count;
+        out_stats->total_bytes  = total_size;
+        out_stats->hash_ns      = hash_t1 - hash_t0;
+        out_stats->sync_ns      = sync_t1 - sync_t0;
+        out_stats->write_cmd_ns = write_t1 - write_t0;
     }
 }
 

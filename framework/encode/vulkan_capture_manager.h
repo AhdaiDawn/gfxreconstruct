@@ -1752,15 +1752,9 @@ class VulkanCaptureManager : public ApiCaptureManager
 
     virtual ~VulkanCaptureManager() {}
 
-    virtual void CreateStateTracker() override
-    {
-        state_tracker_ = std::make_unique<VulkanStateTracker>();
-    }
+    virtual void CreateStateTracker() override { state_tracker_ = std::make_unique<VulkanStateTracker>(); }
 
-    virtual void DestroyStateTracker() override
-    {
-        state_tracker_ = nullptr;
-    }
+    virtual void DestroyStateTracker() override { state_tracker_ = nullptr; }
 
     virtual void WriteTrackedState(util::FileOutputStream* file_stream, util::ThreadData* thread_data) override;
 
@@ -1773,10 +1767,7 @@ class VulkanCaptureManager : public ApiCaptureManager
                              const std::string*      asset_file_name,
                              util::ThreadData*       thread_data) override;
 
-    CaptureSettings::TraceSettings GetDefaultTraceSettings() override
-    {
-        return layer_settings_;
-    }
+    CaptureSettings::TraceSettings GetDefaultTraceSettings() override { return layer_settings_; }
 
   private:
     struct HardwareBufferInfo
@@ -1836,6 +1827,23 @@ class VulkanCaptureManager : public ApiCaptureManager
   private:
     void QueueSubmitWriteFillMemoryCmd();
 
+    // Per-memory-object timing stats returned by ProcessShadowMemoryDirtyPages.
+    struct ShadowDirtyStats
+    {
+        size_t  total_pages{ 0 };
+        size_t  dirty_pages{ 0 };
+        size_t  dirty_bytes{ 0 };
+        size_t  total_bytes{ 0 };
+        int64_t hash_ns{ 0 };      // Time spent computing hashes (nanoseconds)
+        int64_t sync_ns{ 0 };      // Time spent memcpy shadow -> real GPU memory
+        int64_t write_cmd_ns{ 0 }; // Time spent in WriteFillMemoryCmd (compression + file I/O)
+    };
+
+    // Shadow buffer dirty detection: scan shadow memory in 4KB pages, compare hashes,
+    // sync dirty pages to real GPU memory, and write only dirty ranges to capture file.
+    void ProcessShadowMemoryDirtyPages(vulkan_wrappers::DeviceMemoryWrapper* wrapper,
+                                       ShadowDirtyStats*                     out_stats = nullptr);
+
     static std::mutex                               instance_lock_;
     static VulkanCaptureManager*                    singleton_;
     static graphics::VulkanLayerTable               vulkan_layer_table_;
@@ -1855,6 +1863,16 @@ class VulkanCaptureManager : public ApiCaptureManager
 #endif
 
     CaptureSettings::TraceSettings layer_settings_;
+
+    // Cumulative performance counters for shadow dirty tracking (unassisted mode).
+    uint64_t shadow_perf_submit_count_{ 0 };
+    uint64_t shadow_perf_total_hash_ns_{ 0 };
+    uint64_t shadow_perf_total_sync_ns_{ 0 };
+    uint64_t shadow_perf_total_write_ns_{ 0 };
+    uint64_t shadow_perf_total_dirty_bytes_{ 0 };
+    uint64_t shadow_perf_total_scanned_bytes_{ 0 };
+    uint64_t shadow_perf_total_dirty_pages_{ 0 };
+    uint64_t shadow_perf_total_scanned_pages_{ 0 };
 };
 
 GFXRECON_END_NAMESPACE(encode)
