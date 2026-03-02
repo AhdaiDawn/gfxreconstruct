@@ -289,10 +289,11 @@ struct DeviceMemoryWrapper : public HandleWrapper<VkDeviceMemory>
 
     // Shadow buffer for unassisted tracking mode with hash-based dirty detection.
     // When active, the application writes to shadow_buffer (fast cached CPU memory),
-    // and only dirty 4KB pages are synced to real_mapped_ptr (WC/uncached GPU memory).
+    // and only dirty 64KB pages are synced to real_mapped_ptr (WC/uncached GPU memory).
     void*                 real_mapped_ptr{ nullptr };  // Original driver-returned mapped pointer
     void*                 shadow_buffer{ nullptr };    // malloc'd shadow buffer returned to app
-    std::vector<uint64_t> page_hashes;                 // Per-4KB-page hash values for dirty detection
+    std::vector<uint64_t> shadow_hashes;               // Per-page hash of shadow buffer (detects app CPU writes)
+    std::vector<uint64_t> real_hashes;                 // Per-page hash of real mapped ptr (detects GPU DMA writes)
     VkDeviceSize          shadow_size{ 0 };            // Size of the shadow buffer in bytes
     bool                  shadow_first_submit{ true }; // Must do full dump on first QueueSubmit after map
 

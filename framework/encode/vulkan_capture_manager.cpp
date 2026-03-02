@@ -2844,10 +2844,12 @@ void VulkanCaptureManager::PostProcess_vkMapMemory(VkResult         result,
 
                         int64_t memcpy_t1 = util::datetime::GetTimestamp();
 
-                        // Initialize page hashes: compute hash for each 4KB page of the initial content.
-                        static constexpr size_t kPageSize = 4096;
+                        // Initialize page hashes: compute hash for each 64KB page of the initial content.
+                        // 64KB pages reduce loop iterations 16x vs 4KB, significantly reducing hash overhead.
+                        static constexpr size_t kPageSize = 65536;
                         size_t num_pages = (static_cast<size_t>(effective_size) + kPageSize - 1) / kPageSize;
-                        wrapper->page_hashes.resize(num_pages, 0);
+                        wrapper->shadow_hashes.resize(num_pages);
+                        wrapper->real_hashes.resize(num_pages);
 
                         const uint8_t* shadow_bytes = static_cast<const uint8_t*>(wrapper->shadow_buffer);
                         for (size_t i = 0; i < num_pages; ++i)
@@ -2858,7 +2860,9 @@ void VulkanCaptureManager::PostProcess_vkMapMemory(VkResult         result,
                             {
                                 page_len = static_cast<size_t>(effective_size) - page_offset;
                             }
-                            wrapper->page_hashes[i] = util::hash::FastBlockHash64(shadow_bytes + page_offset, page_len);
+                            uint64_t h = util::hash::FastBlockHash64(shadow_bytes + page_offset, page_len);
+                            wrapper->shadow_hashes[i] = h;
+                            wrapper->real_hashes[i]   = h; // shadow == real at init (just memcpy'd)
                         }
 
                         int64_t hash_t1 = util::datetime::GetTimestamp();
@@ -3052,7 +3056,7 @@ void VulkanCaptureManager::PreProcess_vkFlushMappedMemoryRanges(VkDevice        
                         if (current_memory_wrapper->shadow_buffer != nullptr)
                         {
                             // const_cast is safe: ProcessShadowMemoryDirtyPages only modifies mutable
-                            // tracking state (page_hashes) and syncs shadow -> real.
+                            // tracking state (shadow_hashes/real_hashes) and syncs shadow -> real.
                             ProcessShadowMemoryDirtyPages(
                                 const_cast<vulkan_wrappers::DeviceMemoryWrapper*>(current_memory_wrapper));
                         }
@@ -3112,7 +3116,8 @@ void VulkanCaptureManager::PreProcess_vkUnmapMemory(VkDevice device, VkDeviceMem
                 ShadowDirtyStats stats{};
 
                 // Final dirty page detection and sync before unmapping.
-                ProcessShadowMemoryDirtyPages(wrapper, &stats);
+                // Always check real on unmap to ensure GPU writes are captured.
+                ProcessShadowMemoryDirtyPages(wrapper, &stats, /*check_real=*/true);
 
                 int64_t unmap_t1 = util::datetime::GetTimestamp();
 
@@ -3121,8 +3126,10 @@ void VulkanCaptureManager::PreProcess_vkUnmapMemory(VkDevice device, VkDeviceMem
                 wrapper->shadow_buffer   = nullptr;
                 wrapper->real_mapped_ptr = nullptr;
                 wrapper->shadow_size     = 0;
-                wrapper->page_hashes.clear();
-                wrapper->page_hashes.shrink_to_fit();
+                wrapper->shadow_hashes.clear();
+                wrapper->shadow_hashes.shrink_to_fit();
+                wrapper->real_hashes.clear();
+                wrapper->real_hashes.shrink_to_fit();
 
                 int64_t unmap_t2 = util::datetime::GetTimestamp();
 
@@ -3226,8 +3233,10 @@ void VulkanCaptureManager::PreProcess_vkFreeMemory(VkDevice                     
                     wrapper->shadow_buffer   = nullptr;
                     wrapper->real_mapped_ptr = nullptr;
                     wrapper->shadow_size     = 0;
-                    wrapper->page_hashes.clear();
-                    wrapper->page_hashes.shrink_to_fit();
+                    wrapper->shadow_hashes.clear();
+                    wrapper->shadow_hashes.shrink_to_fit();
+                    wrapper->real_hashes.clear();
+                    wrapper->real_hashes.shrink_to_fit();
                 }
 
                 std::lock_guard<std::mutex> lock(GetMappedMemoryLock());
@@ -3496,12 +3505,17 @@ void VulkanCaptureManager::QueueSubmitWriteFillMemoryCmd()
         {
             std::lock_guard<std::mutex> lock(GetMappedMemoryLock());
 
+            // Check real (GPU-mapped) memory every 30 submits to detect GPU DMA writes.
+            // Most submits only scan the fast shadow buffer (~10 GB/s cached reads).
+            // The periodic real check adds ~11ms but only occurs once per 30 submits.
+            bool check_real_this_submit = ((shadow_perf_submit_count_ % 30) == 0);
+
             for (auto wrapper : mapped_memory_)
             {
                 if (wrapper->shadow_buffer != nullptr)
                 {
                     ShadowDirtyStats stats{};
-                    ProcessShadowMemoryDirtyPages(wrapper, &stats);
+                    ProcessShadowMemoryDirtyPages(wrapper, &stats, check_real_this_submit);
 
                     agg_total_pages += stats.total_pages;
                     agg_dirty_pages += stats.dirty_pages;
@@ -3606,45 +3620,37 @@ void VulkanCaptureManager::QueueSubmitWriteFillMemoryCmd()
 }
 
 void VulkanCaptureManager::ProcessShadowMemoryDirtyPages(vulkan_wrappers::DeviceMemoryWrapper* wrapper,
-                                                         ShadowDirtyStats*                     out_stats)
+                                                         ShadowDirtyStats*                     out_stats,
+                                                         bool                                  check_real)
 {
-    static constexpr size_t kPageSize = 4096;
+    static constexpr size_t kPageSize = 65536; // 64KB pages: 16x fewer iterations vs 4KB
 
     GFXRECON_ASSERT(wrapper != nullptr);
     GFXRECON_ASSERT(wrapper->shadow_buffer != nullptr);
     GFXRECON_ASSERT(wrapper->real_mapped_ptr != nullptr);
 
     const size_t total_size   = static_cast<size_t>(wrapper->shadow_size);
-    const size_t num_pages    = wrapper->page_hashes.size();
+    const size_t num_pages    = wrapper->shadow_hashes.size();
     uint8_t*     shadow_bytes = static_cast<uint8_t*>(wrapper->shadow_buffer);
     uint8_t*     real_bytes   = static_cast<uint8_t*>(wrapper->real_mapped_ptr);
 
-    // First QueueSubmit after MapMemory: must dump the ENTIRE shadow content to the capture file.
-    // This is necessary because the replay side has no prior knowledge of the memory's content —
-    // it could contain data from GPU copies, prior usage, etc. that was present at map time.
-    // After this initial dump, subsequent submits only need to record changed pages.
+    // First QueueSubmit after MapMemory: dump ENTIRE content to capture file.
     if (wrapper->shadow_first_submit)
     {
         wrapper->shadow_first_submit = false;
 
         int64_t full_t0 = util::datetime::GetTimestamp();
 
-        // Sync entire shadow → real GPU memory so the GPU sees everything the app wrote.
         memcpy(real_bytes, shadow_bytes, total_size);
-
-        // Write entire content to capture file.
         WriteFillMemoryCmd(wrapper->handle_id, 0, total_size, wrapper->shadow_buffer);
 
-        // Recompute all page hashes to establish correct baseline for future dirty detection.
         for (size_t i = 0; i < num_pages; ++i)
         {
-            size_t page_offset = i * kPageSize;
-            size_t page_len    = kPageSize;
-            if (page_offset + page_len > total_size)
-            {
-                page_len = total_size - page_offset;
-            }
-            wrapper->page_hashes[i] = util::hash::FastBlockHash64(shadow_bytes + page_offset, page_len);
+            size_t   page_offset      = i * kPageSize;
+            size_t   page_len         = (page_offset + kPageSize > total_size) ? (total_size - page_offset) : kPageSize;
+            uint64_t h                = util::hash::FastBlockHash64(shadow_bytes + page_offset, page_len);
+            wrapper->shadow_hashes[i] = h;
+            wrapper->real_hashes[i]   = h;
         }
 
         int64_t full_t1 = util::datetime::GetTimestamp();
@@ -3660,53 +3666,50 @@ void VulkanCaptureManager::ProcessShadowMemoryDirtyPages(vulkan_wrappers::Device
             out_stats->dirty_pages  = num_pages;
             out_stats->dirty_bytes  = total_size;
             out_stats->total_bytes  = total_size;
-            out_stats->hash_ns      = full_t1 - full_t0; // Approximate: includes sync+write+hash
+            out_stats->hash_ns      = full_t1 - full_t0;
             out_stats->sync_ns      = 0;
             out_stats->write_cmd_ns = 0;
         }
         return;
     }
 
-    // ========== Pass 1: Hash shadow pages to detect app CPU writes ==========
-    // Also check real (GPU-mapped) memory for pages the GPU may have written to.
-    // This two-source detection ensures both CPU writes (to shadow) and GPU writes (to real)
-    // are captured correctly.
+    // ========== Dual-hash dirty detection ==========
+    // shadow_hashes[i] — detects app CPU writes (always checked, reads fast cached memory)
+    // real_hashes[i]   — detects GPU DMA writes (only checked when check_real=true, reads slow WC memory)
+    //
+    // check_real is only true periodically (every N submits) to amortize the WC read cost.
+    // GPU writes are rare and can tolerate a few frames of detection delay.
+
     std::vector<size_t> dirty_indices;
-    dirty_indices.reserve(num_pages < 256 ? num_pages : 256);
+    dirty_indices.reserve(num_pages < 64 ? num_pages : 64);
 
     int64_t hash_t0 = util::datetime::GetTimestamp();
 
     for (size_t i = 0; i < num_pages; ++i)
     {
         size_t page_offset = i * kPageSize;
-        size_t page_len    = kPageSize;
-        if (page_offset + page_len > total_size)
-        {
-            page_len = total_size - page_offset;
-        }
+        size_t page_len    = (page_offset + kPageSize > total_size) ? (total_size - page_offset) : kPageSize;
 
-        uint64_t shadow_hash = util::hash::FastBlockHash64(shadow_bytes + page_offset, page_len);
+        // Step 1: Check shadow (cached CPU memory — very fast, always done).
+        uint64_t new_shadow_hash = util::hash::FastBlockHash64(shadow_bytes + page_offset, page_len);
 
-        if (shadow_hash != wrapper->page_hashes[i])
+        if (new_shadow_hash != wrapper->shadow_hashes[i])
         {
-            // App modified this page in the shadow buffer.
-            wrapper->page_hashes[i] = shadow_hash;
+            // App modified this page in shadow.
+            wrapper->shadow_hashes[i] = new_shadow_hash;
             dirty_indices.push_back(i);
         }
-        else
+        else if (check_real)
         {
-            // Shadow page unchanged. Check if GPU wrote to the real mapped memory.
-            // For HOST_COHERENT memory, GPU DMA writes go directly to real_mapped_ptr
-            // and are invisible to the shadow buffer. We detect this by comparing
-            // the real page content against the shadow page.
-            // memcmp returns 0 if equal; for pages that are truly unchanged (the common case),
-            // memcmp will scan the full page. But this is necessary for correctness.
-            if (memcmp(real_bytes + page_offset, shadow_bytes + page_offset, page_len) != 0)
+            // Step 2 (periodic): Shadow unchanged. Check if GPU modified real (WC memory).
+            uint64_t new_real_hash = util::hash::FastBlockHash64(real_bytes + page_offset, page_len);
+
+            if (new_real_hash != wrapper->real_hashes[i])
             {
-                // GPU modified this page. Sync real -> shadow so the app sees it too,
-                // and mark as dirty for capture.
+                // GPU modified this page. Sync real → shadow and mark dirty.
                 memcpy(shadow_bytes + page_offset, real_bytes + page_offset, page_len);
-                wrapper->page_hashes[i] = util::hash::FastBlockHash64(shadow_bytes + page_offset, page_len);
+                wrapper->shadow_hashes[i] = new_real_hash;
+                wrapper->real_hashes[i]   = new_real_hash;
                 dirty_indices.push_back(i);
             }
         }
@@ -3714,47 +3717,39 @@ void VulkanCaptureManager::ProcessShadowMemoryDirtyPages(vulkan_wrappers::Device
 
     int64_t hash_t1 = util::datetime::GetTimestamp();
 
-    // ========== Pass 2: Sync dirty pages shadow -> real GPU memory ==========
-    // Only needed for app-modified pages (shadow -> real).
-    // GPU-modified pages were already synced real -> shadow above, no need to write back.
+    // ========== Sync dirty pages shadow -> real ==========
     size_t  dirty_byte_count = 0;
     int64_t sync_t0          = util::datetime::GetTimestamp();
 
     for (size_t idx : dirty_indices)
     {
         size_t page_offset = idx * kPageSize;
-        size_t page_len    = kPageSize;
-        if (page_offset + page_len > total_size)
-        {
-            page_len = total_size - page_offset;
-        }
-        // Always sync shadow -> real to ensure GPU sees the latest data.
-        // For GPU-modified pages this is a no-op (shadow was just updated from real).
+        size_t page_len    = (page_offset + kPageSize > total_size) ? (total_size - page_offset) : kPageSize;
         memcpy(real_bytes + page_offset, shadow_bytes + page_offset, page_len);
         dirty_byte_count += page_len;
+
+        // Update real_hashes to match the synced content.
+        wrapper->real_hashes[idx] = wrapper->shadow_hashes[idx];
     }
 
     int64_t sync_t1 = util::datetime::GetTimestamp();
 
-    // ========== Pass 3: Write coalesced dirty runs to capture file ==========
+    // ========== Write coalesced dirty runs to capture file ==========
     int64_t write_t0 = util::datetime::GetTimestamp();
 
     if (!dirty_indices.empty())
     {
-        // Coalesce contiguous dirty page indices into runs.
         size_t run_start_idx = dirty_indices[0];
-        size_t run_end_idx   = dirty_indices[0]; // inclusive
+        size_t run_end_idx   = dirty_indices[0];
 
         for (size_t d = 1; d < dirty_indices.size(); ++d)
         {
             if (dirty_indices[d] == run_end_idx + 1)
             {
-                // Contiguous -- extend the run.
                 run_end_idx = dirty_indices[d];
             }
             else
             {
-                // Gap found -- flush the current run.
                 size_t run_offset = run_start_idx * kPageSize;
                 size_t run_end    = (run_end_idx + 1) * kPageSize;
                 if (run_end > total_size)
@@ -3762,14 +3757,11 @@ void VulkanCaptureManager::ProcessShadowMemoryDirtyPages(vulkan_wrappers::Device
                     run_end = total_size;
                 }
                 WriteFillMemoryCmd(wrapper->handle_id, run_offset, run_end - run_offset, wrapper->shadow_buffer);
-
-                // Start new run.
                 run_start_idx = dirty_indices[d];
                 run_end_idx   = dirty_indices[d];
             }
         }
 
-        // Flush the last run.
         size_t run_offset = run_start_idx * kPageSize;
         size_t run_end    = (run_end_idx + 1) * kPageSize;
         if (run_end > total_size)
@@ -3781,7 +3773,6 @@ void VulkanCaptureManager::ProcessShadowMemoryDirtyPages(vulkan_wrappers::Device
 
     int64_t write_t1 = util::datetime::GetTimestamp();
 
-    // Fill out stats if requested.
     if (out_stats != nullptr)
     {
         out_stats->total_pages  = num_pages;

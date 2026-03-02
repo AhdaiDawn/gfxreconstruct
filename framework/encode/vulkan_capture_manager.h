@@ -1842,7 +1842,8 @@ class VulkanCaptureManager : public ApiCaptureManager
     // Shadow buffer dirty detection: scan shadow memory in 4KB pages, compare hashes,
     // sync dirty pages to real GPU memory, and write only dirty ranges to capture file.
     void ProcessShadowMemoryDirtyPages(vulkan_wrappers::DeviceMemoryWrapper* wrapper,
-                                       ShadowDirtyStats*                     out_stats = nullptr);
+                                       ShadowDirtyStats*                     out_stats  = nullptr,
+                                       bool                                  check_real = false);
 
     static std::mutex                               instance_lock_;
     static VulkanCaptureManager*                    singleton_;
